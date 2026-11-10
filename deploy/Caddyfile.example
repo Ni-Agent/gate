@@ -1,0 +1,11 @@
+gate.example.org {
+    @gate path /mcp /authorize /token /.well-known/oauth-authorization-server /.well-known/oauth-protected-resource /.well-known/oauth-protected-resource/mcp /kb /kb/* /tasks /tasks/* /identities /healthz /whoami /events
+    handle @gate {
+        reverse_proxy 127.0.0.1:18084 {
+            header_up Host localhost:18084
+        }
+    }
+    handle {
+        respond "Not found" 404
+    }
+}

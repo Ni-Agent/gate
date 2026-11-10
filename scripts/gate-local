@@ -1,0 +1,40 @@
+#!/bin/sh
+# Run from the extracted distribution or repository root.
+set -eu
+base=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+instance=${GATE_HOME:-"$HOME/.local/share/gate"}
+url=http://127.0.0.1:18084
+case ${1:-} in
+  setup)
+    umask 077
+    if curl -fsS "$url/healthz" >/dev/null 2>&1; then echo "Port 18084 already serves a Gate instance; stop it before setup." >&2; exit 1; fi
+    mkdir -p "$instance"
+    "$base/gate-init" -config "$instance/config" -data "$instance/data" -public-url "$url"
+    "$0" run >"$instance/setup.log" 2>&1 &
+    pid=$!
+    trap 'kill "$pid" 2>/dev/null || :; wait "$pid" 2>/dev/null || :' EXIT HUP INT TERM
+    ready=0
+    for n in 1 2 3 4 5 6 7 8 9 10; do
+      if curl -fsS "$url/healthz" >/dev/null 2>&1 && kill -0 "$pid" 2>/dev/null; then ready=1; break; fi
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 1
+    done
+    if [ "$ready" != 1 ]; then echo "Gate failed to start; see $instance/setup.log" >&2; exit 1; fi
+    "$base/gate-admin" -url "$url" -operator-token-file "$instance/config/operator.token" -tokens "$instance/config/tokens.json" -identity agent:hermes -out "$instance/config/hermes.token"
+    echo "Setup complete. Start Gate with: $0 run"
+    ;;
+  verify)
+    umask 077
+    header=$(mktemp "${TMPDIR:-/tmp}/gate-header.XXXXXXXX")
+    trap 'rm -f "$header"' EXIT HUP INT TERM
+    printf 'Authorization: Bearer %s\n' "$(cat "$instance/config/hermes.token")" >"$header"
+    status=$(curl -sS -o /dev/null -w '%{http_code}' "$url/whoami")
+    [ "$status" = 401 ] || { echo "Unauthenticated request was not rejected." >&2; exit 1; }
+    curl -fsS -H @"$header" "$url/whoami" | grep -q 'agent:hermes' || { echo "Hermes token verification failed." >&2; exit 1; }
+    echo "Gate is reachable and the Hermes token is valid."
+    ;;
+  run)
+    exec "$base/gate" -addr 127.0.0.1:18084 -repo "$instance/data/workspace.git" -public-url "$url" -credentials "$instance/config/credentials.json" -tokens "$instance/config/tokens.json" -oauth-state "$instance/data/auth/sessions.json"
+    ;;
+  *) echo "Usage: $0 setup|run|verify" >&2; exit 2 ;;
+esac

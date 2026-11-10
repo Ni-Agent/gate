@@ -1,0 +1,33 @@
+[Unit]
+Description=Gate shared knowledge and tasks
+After=network-online.target
+Wants=network-online.target
+[Service]
+User=gate
+Group=gate
+Environment=GOMEMLIMIT=192MiB
+LoadCredential=oauth.json:/etc/gate/credentials.json
+LoadCredential=tokens.json:/etc/gate/tokens.json
+ExecStart=/usr/local/libexec/gate -addr 127.0.0.1:18084 -public-url https://gate.example.org -credentials ${CREDENTIALS_DIRECTORY}/oauth.json -tokens ${CREDENTIALS_DIRECTORY}/tokens.json -repo /var/lib/gate/workspace.git -oauth-state /var/lib/gate/auth/sessions.json
+Restart=on-failure
+RestartSec=5
+UMask=0077
+StateDirectory=gate
+StateDirectoryMode=0700
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+IPAddressDeny=any
+IPAddressAllow=localhost
+MemoryMax=256M
+TasksMax=64
+[Install]
+WantedBy=multi-user.target
