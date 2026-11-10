@@ -55,12 +55,12 @@ For ChatGPT use the server's `/mcp` URL and the privately generated OAuth client
 and secret in `/etc/gate/credentials.json`. On its authorize page the human enters
 the generated login password from that same private file. This is distinct from
 the agent's machine token. Existing OAuth callback configuration targets ChatGPT;
-the configured callback is for ChatGPT.
+see [Grok OAuth](features/grok-oauth.md) for optional Grok access.
 
 All data identities have equal access. Administration of machine credentials is
 an OS-admin operation over SSH/sudo; there is no public dashboard or online token
 mint endpoint. Root access already controls this host and its authentication files.
 
 Upgrades preserve `/var/lib/gate/workspace.git`, `/var/lib/gate/auth` and
-`/etc/gate`. Replace the executable, restart, and verify readiness; never rerun
+`/etc/gate`. Preserve existing systemd drop-ins and all service flags. Replace the executable, restart, and verify readiness; never rerun
 initialization. Keep the previous executable for rollback. 

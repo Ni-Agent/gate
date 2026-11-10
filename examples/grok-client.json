@@ -1,0 +1,18 @@
+{
+  "client_id": "https://grok.com/oauth/mcp-client.json",
+  "client_name": "Grok",
+  "client_uri": "https://grok.com",
+  "logo_uri": "https://grok.com/icon-512x512.png",
+  "redirect_uris": [
+    "https://grok.com/connectors-oauth-exchange-code/",
+    "https://console.x.ai/connectors-oauth-exchange-code/"
+  ],
+  "grant_types": [
+    "authorization_code",
+    "refresh_token"
+  ],
+  "response_types": [
+    "code"
+  ],
+  "token_endpoint_auth_method": "none"
+}

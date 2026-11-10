@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -24,20 +25,27 @@ import (
 	"golang.org/x/time/rate"
 )
 
-// Credentials describe one explicitly registered client and one human login.
-// It has no signup or DCR; Gate uses durable rotating token sessions.
+// Credentials retain the existing ChatGPT registration and shared owner login.
+// Grok is an optional, independently attributed public PKCE client.
 type Credentials struct {
-	ClientID      string `json:"client_id"`
-	ClientSecret  string `json:"client_secret"`
-	CallbackURL   string `json:"callback_url"`
-	Identity      string `json:"identity,omitempty"`
-	LoginPassword string `json:"login_password"`
+	ClientID      string              `json:"client_id"`
+	ClientSecret  string              `json:"client_secret"`
+	CallbackURL   string              `json:"callback_url"`
+	Identity      string              `json:"identity,omitempty"`
+	LoginPassword string              `json:"login_password"`
+	Grok          *GrokClientMetadata `json:"grok,omitempty"`
 }
 type pendingLogin struct {
 	query   string
 	expires time.Time
 }
+type registeredClient struct {
+	client   *fosite.DefaultClient
+	name     string
+	identity string
+}
 type LocalAuth struct {
+	clients     map[string]registeredClient
 	config      Config
 	credentials Credentials
 	provider    fosite.OAuth2Provider
@@ -80,6 +88,14 @@ func NewPersistentAuth(c Config, cred Credentials, statePath string) (*LocalAuth
 	if cred.ClientID == "" || len(cred.ClientSecret) < 32 || len(cred.LoginPassword) < 32 {
 		return nil, errors.New("test credentials require an ID and at least 32-character random secrets")
 	}
+	if cred.Grok != nil {
+		if e := cred.Grok.Validate(); e != nil {
+			return nil, e
+		}
+		if cred.ClientID == GrokClientID {
+			return nil, errors.New("duplicate OAuth client ID")
+		}
+	}
 	hashed, e := bcrypt.GenerateFromPassword([]byte(cred.ClientSecret), bcrypt.DefaultCost)
 	if e != nil {
 		return nil, e
@@ -89,9 +105,16 @@ func NewPersistentAuth(c Config, cred Credentials, statePath string) (*LocalAuth
 		return nil, e
 	}
 	memory.Clients[cred.ClientID] = &fosite.DefaultClient{ID: cred.ClientID, Secret: hashed, RedirectURIs: []string{cred.CallbackURL}, GrantTypes: []string{"authorization_code", "refresh_token"}, ResponseTypes: []string{"code"}, Scopes: []string{ReadScope, WriteScope, "offline_access"}, Audience: []string{c.PublicURL + "/mcp"}}
+	clients := map[string]registeredClient{cred.ClientID: {client: memory.Clients[cred.ClientID].(*fosite.DefaultClient), name: "ChatGPT", identity: cred.Identity}}
+	if cred.Grok != nil {
+		g := cred.Grok
+		client := &fosite.DefaultClient{ID: g.ClientID, Public: true, RedirectURIs: slices.Clone(g.RedirectURIs), GrantTypes: slices.Clone(g.GrantTypes), ResponseTypes: slices.Clone(g.ResponseTypes), Scopes: []string{ReadScope, WriteScope, "offline_access"}, Audience: []string{c.PublicURL + "/mcp"}}
+		memory.Clients[g.ClientID] = client
+		clients[g.ClientID] = registeredClient{client: client, name: "Grok", identity: GrokIdentity}
+	}
 	settings := &fosite.Config{GlobalSecret: []byte(memory.state.Secret), AccessTokenLifespan: time.Hour, RefreshTokenLifespan: 90 * 24 * time.Hour, RefreshTokenScopes: []string{}, AuthorizeCodeLifespan: 2 * time.Minute, EnforcePKCE: true, EnforcePKCEForPublicClients: true, EnablePKCEPlainChallengeMethod: false, ScopeStrategy: fosite.ExactScopeStrategy, MinParameterEntropy: 8, DisableRefreshTokenValidation: true}
 	provider := compose.Compose(settings, memory, compose.NewOAuth2HMACStrategy(settings), compose.OAuth2AuthorizeExplicitFactory, compose.OAuth2PKCEFactory, compose.OAuth2RefreshTokenGrantFactory, compose.OAuth2TokenIntrospectionFactory)
-	return &LocalAuth{config: c, credentials: cred, provider: provider, pending: make(map[string]pendingLogin), tokens: memory, limiter: rate.NewLimiter(rate.Every(time.Second), 10)}, nil
+	return &LocalAuth{clients: clients, config: c, credentials: cred, provider: provider, pending: make(map[string]pendingLogin), tokens: memory, limiter: rate.NewLimiter(rate.Every(time.Second), 10)}, nil
 }
 
 func (a *LocalAuth) Verify(ctx context.Context, token string, _ *http.Request) (*auth.TokenInfo, error) {
@@ -105,7 +128,11 @@ func (a *LocalAuth) Verify(ctx context.Context, token string, _ *http.Request) (
 	}
 	session := &fosite.DefaultSession{}
 	_, request, err := a.provider.IntrospectToken(ctx, token, fosite.AccessToken, session, ReadScope)
-	if err != nil || !request.GetGrantedAudience().Has(a.config.PublicURL+"/mcp") || request.GetSession().GetSubject() != a.credentials.Identity {
+	if err != nil {
+		return nil, auth.ErrInvalidToken
+	}
+	client, ok := a.clients[request.GetClient().GetID()]
+	if !ok || !request.GetGrantedAudience().Has(a.config.PublicURL+"/mcp") || request.GetSession().GetSubject() != client.identity {
 		return nil, auth.ErrInvalidToken
 	}
 	return &auth.TokenInfo{UserID: request.GetSession().GetSubject(), Scopes: request.GetGrantedScopes(), Expiration: request.GetSession().GetExpiresAt(fosite.AccessToken)}, nil
@@ -115,7 +142,11 @@ func (a *LocalAuth) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /.well-known/oauth-authorization-server", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{"issuer": a.config.PublicURL, "authorization_response_iss_parameter_supported": true, "authorization_endpoint": a.config.PublicURL + "/authorize", "token_endpoint": a.config.PublicURL + "/token", "response_types_supported": []string{"code"}, "grant_types_supported": []string{"authorization_code", "refresh_token"}, "token_endpoint_auth_methods_supported": []string{"client_secret_basic", "client_secret_post"}, "code_challenge_methods_supported": []string{"S256"}, "scopes_supported": []string{ReadScope, WriteScope, "offline_access"}})
+		methods := []string{"client_secret_basic", "client_secret_post"}
+		if a.credentials.Grok != nil {
+			methods = append(methods, "none")
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"client_id_metadata_document_supported": a.credentials.Grok != nil, "issuer": a.config.PublicURL, "authorization_response_iss_parameter_supported": true, "authorization_endpoint": a.config.PublicURL + "/authorize", "token_endpoint": a.config.PublicURL + "/token", "response_types_supported": []string{"code"}, "grant_types_supported": []string{"authorization_code", "refresh_token"}, "token_endpoint_auth_methods_supported": methods, "code_challenge_methods_supported": []string{"S256"}, "scopes_supported": []string{ReadScope, WriteScope, "offline_access"}})
 	})
 	mux.HandleFunc("GET /authorize", a.startLogin)
 	mux.HandleFunc("POST /authorize", a.finishLogin)
@@ -131,9 +162,8 @@ func (a *LocalAuth) Handler() http.Handler {
 		w.Header().Set("Pragma", "no-cache")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("Referrer-Policy", "no-referrer")
-		// Chromium applies form-action to the OAuth redirect after the POST.
-		// Permit only our own form and this client's validated callback.
-		w.Header().Set("Content-Security-Policy", "default-src 'none'; form-action 'self' "+a.credentials.CallbackURL+"; frame-ancestors 'none'; base-uri 'none'")
+		// The login handlers add only the validated flow's exact callback.
+		setCallbackPolicy(w, "")
 		if !a.limiter.Allow() {
 			w.Header().Set("Retry-After", "1")
 			http.Error(w, "rate limited", 429)
@@ -151,7 +181,7 @@ func (a *LocalAuth) Handler() http.Handler {
 			}
 		}
 		if r.URL.Path == "/token" {
-			log.Printf("oauth_token client=%q grant=%q status=%d", a.credentials.ClientID, r.PostForm.Get("grant_type"), recorder.Code)
+			log.Printf("oauth_token client=%q grant=%q status=%d", tokenClientID(r), r.PostForm.Get("grant_type"), recorder.Code)
 		}
 		for key, values := range recorder.Header() {
 			w.Header()[key] = values
@@ -168,7 +198,8 @@ func (a *LocalAuth) validateRequest(r *http.Request) error {
 			return errors.New("duplicate parameters")
 		}
 	}
-	if q.Get("client_id") != a.credentials.ClientID || q.Get("redirect_uri") != a.credentials.CallbackURL || q.Get("resource") != a.config.PublicURL+"/mcp" || q.Get("response_type") != "code" || q.Get("response_mode") != "" && q.Get("response_mode") != "query" || q.Get("code_challenge_method") != "S256" {
+	client, ok := a.clients[q.Get("client_id")]
+	if !ok || !slices.Contains(client.client.RedirectURIs, q.Get("redirect_uri")) || q.Get("resource") != a.config.PublicURL+"/mcp" || q.Get("response_type") != "code" || q.Get("response_mode") != "" && q.Get("response_mode") != "query" || q.Get("code_challenge_method") != "S256" {
 		return errors.New("invalid client, redirect, resource or flow")
 	}
 	challenge, e := base64.RawURLEncoding.DecodeString(q.Get("code_challenge"))
@@ -181,13 +212,14 @@ func (a *LocalAuth) validateRequest(r *http.Request) error {
 	return nil
 }
 
-var consent = template.Must(template.New("consent").Parse(`<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Gate login</title><h1>Connect ChatGPT to Gate</h1><p>This connection can read and update your Gate knowledge base and tasks.</p><p>Requested permissions: {{.Scopes}}</p><form method="post" action="/authorize"><input type="hidden" name="flow" value="{{.Flow}}"><label>Gate login password <input type="password" name="password" required autocomplete="current-password"></label><button type="submit">Sign in and allow</button></form></html>`))
+var consent = template.Must(template.New("consent").Parse(`<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Gate login</title><h1>Connect {{.Client}} to Gate</h1><p>This connection can read and update your Gate knowledge base and tasks.</p><p>Requested permissions: {{.Scopes}}</p><form method="post" action="/authorize"><input type="hidden" name="flow" value="{{.Flow}}"><label>Gate login password <input type="password" name="password" required autocomplete="current-password"></label><button type="submit">Sign in and allow</button></form></html>`))
 
 func (a *LocalAuth) startLogin(w http.ResponseWriter, r *http.Request) {
 	if err := a.validateRequest(r); err != nil {
 		http.Error(w, "invalid authorization request", 400)
 		return
 	}
+	setCallbackPolicy(w, r.URL.Query().Get("redirect_uri"))
 	ar, err := a.provider.NewAuthorizeRequest(r.Context(), r)
 	if err != nil {
 		http.Error(w, "invalid authorization request", 400)
@@ -218,7 +250,7 @@ func (a *LocalAuth) startLogin(w http.ResponseWriter, r *http.Request) {
 	// same-origin proof for our CSRF check without leaking OAuth query values
 	// to the external callback. Other auth responses retain no-referrer.
 	w.Header().Set("Referrer-Policy", "same-origin")
-	_ = consent.Execute(w, map[string]string{"Flow": flow, "Scopes": strings.Join(ar.GetRequestedScopes(), ", ")})
+	_ = consent.Execute(w, map[string]string{"Client": a.clients[ar.GetClient().GetID()].name, "Flow": flow, "Scopes": strings.Join(ar.GetRequestedScopes(), ", ")})
 }
 
 func (a *LocalAuth) finishLogin(w http.ResponseWriter, r *http.Request) {
@@ -247,15 +279,20 @@ func (a *LocalAuth) finishLogin(w http.ResponseWriter, r *http.Request) {
 	delete(a.pending, flow)
 	a.mu.Unlock()
 	if !ok || time.Now().After(pending.expires) {
-		http.Error(w, "login expired; reconnect from ChatGPT", 400)
+		http.Error(w, "login expired; reconnect from your connector", 400)
 		return
 	}
 	got, want := sha256.Sum256([]byte(r.PostForm.Get("password"))), sha256.Sum256([]byte(a.credentials.LoginPassword))
 	if subtle.ConstantTimeCompare(got[:], want[:]) != 1 {
-		http.Error(w, "login failed; reconnect from ChatGPT", 401)
+		http.Error(w, "login failed; reconnect from your connector", 401)
 		return
 	}
 	original, _ := http.NewRequestWithContext(r.Context(), "GET", a.config.PublicURL+"/authorize?"+pending.query, nil)
+	if err := a.validateRequest(original); err != nil {
+		http.Error(w, "invalid authorization request", 400)
+		return
+	}
+	setCallbackPolicy(w, original.URL.Query().Get("redirect_uri"))
 	ar, err := a.provider.NewAuthorizeRequest(r.Context(), original)
 	if err != nil {
 		http.Error(w, "invalid authorization request", 400)
@@ -265,7 +302,7 @@ func (a *LocalAuth) finishLogin(w http.ResponseWriter, r *http.Request) {
 		ar.GrantScope(scope)
 	}
 	ar.GrantAudience(a.config.PublicURL + "/mcp")
-	response, err := a.provider.NewAuthorizeResponse(r.Context(), ar, &fosite.DefaultSession{Subject: a.credentials.Identity})
+	response, err := a.provider.NewAuthorizeResponse(r.Context(), ar, &fosite.DefaultSession{Subject: a.clients[ar.GetClient().GetID()].identity})
 	if err != nil {
 		http.Error(w, "authorization failed", 400)
 		return
@@ -286,10 +323,20 @@ func (a *LocalAuth) token(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	client, ok := a.clients[tokenClientID(r)]
+	if !ok {
+		http.Error(w, "invalid client", 401)
+		return
+	}
+	// Public clients authenticate the code with PKCE, never a shared secret.
+	if client.client.Public && (r.Header.Get("Authorization") != "" || r.PostForm.Has("client_secret") || r.PostForm.Has("client_assertion") || r.PostForm.Has("client_assertion_type")) {
+		http.Error(w, "invalid public client authentication", 400)
+		return
+	}
 	grant := r.PostForm.Get("grant_type")
 	resource := r.PostForm.Get("resource")
 	redirect := r.PostForm.Get("redirect_uri")
-	if (grant == "authorization_code" && (resource != a.config.PublicURL+"/mcp" || redirect != a.credentials.CallbackURL)) || (grant == "refresh_token" && ((resource != "" && resource != a.config.PublicURL+"/mcp") || (redirect != "" && redirect != a.credentials.CallbackURL))) || (grant != "authorization_code" && grant != "refresh_token") {
+	if (grant == "authorization_code" && (resource != a.config.PublicURL+"/mcp" || !slices.Contains(client.client.RedirectURIs, redirect))) || (grant == "refresh_token" && ((resource != "" && resource != a.config.PublicURL+"/mcp") || (redirect != "" && !slices.Contains(client.client.RedirectURIs, redirect)))) || (grant != "authorization_code" && grant != "refresh_token") {
 		http.Error(w, "invalid token resource, grant or redirect", 400)
 		return
 	}
@@ -308,4 +355,28 @@ func (a *LocalAuth) token(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.provider.WriteAccessResponse(r.Context(), w, access, response)
+}
+
+// tokenClientID is used for boundary validation and sanitized attribution logs;
+// Fosite still authenticates the confidential client and binds tokens to clients.
+func tokenClientID(r *http.Request) string {
+	if id, _, ok := r.BasicAuth(); ok {
+		decoded, err := url.QueryUnescape(id)
+		if err != nil {
+			return ""
+		}
+		if formID := r.PostForm.Get("client_id"); formID != "" && formID != decoded {
+			return ""
+		}
+		return decoded
+	}
+	return r.PostForm.Get("client_id")
+}
+
+func setCallbackPolicy(w http.ResponseWriter, callback string) {
+	action := "'self'"
+	if callback != "" {
+		action += " " + callback
+	}
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; form-action "+action+"; frame-ancestors 'none'; base-uri 'none'")
 }

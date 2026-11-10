@@ -40,6 +40,7 @@ func main() {
 	repo := flag.String("repo", "", "service-owned bare Git repository")
 	public := flag.String("public-url", "", "public HTTPS origin")
 	credentials := flag.String("credentials", "", "private OAuth credentials JSON")
+	grokMetadata := flag.String("grok-client-metadata", "", "operator-reviewed Grok client metadata JSON; optional")
 	tokens := flag.String("tokens", "", "private machine token hash JSON; optional")
 	mint := flag.String("mint-token", "", "registered identity to issue a token for; writes token once to stdout and exits")
 	authState := flag.String("oauth-state", "", "private durable OAuth state JSON outside KB")
@@ -103,6 +104,15 @@ func main() {
 	var cred mcptest.Credentials
 	if e = privateJSON(*credentials, &cred); e != nil {
 		log.Fatal(e)
+	}
+	if *grokMetadata != "" {
+		cred.Grok = &mcptest.GrokClientMetadata{}
+		if e = privateJSON(*grokMetadata, cred.Grok); e != nil {
+			log.Fatal(e)
+		}
+	}
+	if cred.Grok != nil && !store.HasIdentity(mcptest.GrokIdentity) {
+		log.Fatal("Grok OAuth identity must be registered in Gate")
 	}
 	if *authState == "" {
 		log.Fatal("-oauth-state required; do not use transient OAuth sessions")

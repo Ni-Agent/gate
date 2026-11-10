@@ -33,4 +33,22 @@ stop
 start
 curl -fsS -H @"$testroot/header" http://127.0.0.1:18084/kb/projects/test | grep -q 'Fresh instance'
 stop
-printf '%s\n' 'Fresh setup, authentication, write and restart passed.'
+# A new instance must fail closed until the Grok identity is registered.
+cp examples/grok-client.json "$testroot/grok.json"
+chmod 600 "$testroot/grok.json"
+grok_start() {
+ "$testroot/gate" -addr 127.0.0.1:18084 -repo "$GATE_HOME/data/workspace.git" -public-url http://127.0.0.1:18084 -credentials "$GATE_HOME/config/credentials.json" -tokens "$GATE_HOME/config/tokens.json" -oauth-state "$GATE_HOME/data/auth/sessions.json" -grok-client-metadata "$testroot/grok.json"
+}
+if grok_start >"$testroot/grok-log" 2>&1; then echo "Grok unexpectedly started without its identity" >&2; exit 1; fi
+grep -q 'Grok OAuth identity must be registered' "$testroot/grok-log"
+start
+printf 'Authorization: Bearer %s\n' "$(cat "$GATE_HOME/config/operator.token")" > "$testroot/header"
+curl -fsS -o /dev/null -H @"$testroot/header" -H 'Content-Type: application/json' -H 'Idempotency-Key: grok-test' --data '{"id":"agent:grok-bot","name":"Grok"}' http://127.0.0.1:18084/identities
+stop
+grok_start >"$testroot/grok-log" 2>&1 & pid=$!
+for n in 1 2 3 4 5 6 7 8 9 10; do
+ if curl -fsS http://127.0.0.1:18084/.well-known/oauth-authorization-server | grep -q '"client_id_metadata_document_supported":true'; then break; fi
+ kill -0 "$pid"; [ "$n" != 10 ]; sleep 1
+done
+stop
+printf '%s\n' 'Fresh setup, authentication, write, restart, and Grok enablement passed.' 
