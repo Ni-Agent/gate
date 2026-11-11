@@ -20,7 +20,7 @@ import (
 	"time"
 )
 
-const Version = "v1.0.0-beta.1"
+const Version = "v0.1.0-beta.1"
 const MaxBody = 1 << 20
 
 var slug = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,95}$`)

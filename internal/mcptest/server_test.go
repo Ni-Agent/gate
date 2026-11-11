@@ -18,6 +18,7 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/auth"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"golang.org/x/time/rate"
 	"workflow-api/internal/content"
 )
 
@@ -92,10 +93,14 @@ func (f *fixture) begin(t *testing.T, scope string) (string, string) {
 	if code != 200 {
 		t.Fatalf("start login: %d %s", code, body)
 	}
+	if !strings.Contains(body, "<style>"+consentCSS+"</style>") {
+		t.Fatal("rendered stylesheet differs from the CSP hash")
+	}
 	if h.Get("Referrer-Policy") != "same-origin" {
 		t.Fatal("login form must preserve Origin on native browser POSTs", h)
 	}
-	wantPolicy := "default-src 'none'; form-action 'self' " + f.cred.CallbackURL + "; frame-ancestors 'none'; base-uri 'none'"
+	styleDigest := sha256.Sum256([]byte(consentCSS))
+	wantPolicy := "default-src 'none'; style-src 'sha256-" + base64.StdEncoding.EncodeToString(styleDigest[:]) + "'; form-action 'self' " + f.cred.CallbackURL + "; frame-ancestors 'none'; base-uri 'none'"
 	if h.Get("Content-Security-Policy") != wantPolicy {
 		t.Fatal("login form must allow only self and the exact registered callback", h)
 	}
@@ -208,9 +213,17 @@ func TestOAuthSecurity(t *testing.T) {
 	t.Run("wrong login", func(t *testing.T) {
 		f := setup(t)
 		flow, _ := f.begin(t, ReadScope)
-		status, _, _ := f.request(t, "POST", "/authorize", url.Values{"flow": {flow}, "password": {"wrong"}}.Encode(), "", map[string]string{"Content-Type": "application/x-www-form-urlencoded", "Origin": f.config.PublicURL})
-		if status != 401 {
-			t.Fatal(status)
+		status, h, body := f.request(t, "POST", "/authorize", url.Values{"flow": {flow}, "password": {"wrong"}}.Encode(), "", map[string]string{"Content-Type": "application/x-www-form-urlencoded", "Origin": f.config.PublicURL})
+		if status != 401 || !strings.Contains(body, "try again") || !strings.Contains(body, "can read shared") || h.Get("Referrer-Policy") != "same-origin" {
+			t.Fatal(status, body)
+		}
+		status, _, _ = f.request(t, "POST", "/authorize", url.Values{"flow": {flow}, "password": {f.cred.LoginPassword}}.Encode(), "", map[string]string{"Content-Type": "application/x-www-form-urlencoded", "Origin": f.config.PublicURL})
+		if status != 302 && status != 303 {
+			t.Fatal("retry failed", status)
+		}
+		status, _, _ = f.request(t, "POST", "/authorize", url.Values{"flow": {flow}, "password": {f.cred.LoginPassword}}.Encode(), "", map[string]string{"Content-Type": "application/x-www-form-urlencoded", "Origin": f.config.PublicURL})
+		if status != 403 && status != 400 {
+			t.Fatal("flow reused", status)
 		}
 	})
 	t.Run("redirect and grant boundaries", func(t *testing.T) {
@@ -344,4 +357,40 @@ func TestExpiredTokenRejected(t *testing.T) {
 	if w.Code != 401 {
 		t.Fatal(w.Code)
 	}
+}
+
+func TestAuthorizeErrorsUseSafeStyledPages(t *testing.T) {
+	tests := []struct {
+		name, path, body, origin string
+		status                   int
+	}{
+		{"origin", "/authorize", "flow=x&password=x", "https://attacker.invalid", 403},
+		{"query", "/authorize?bad=1", "flow=x&password=x", "https://workspace.example.invalid", 400},
+		{"duplicate", "/authorize", "flow=x&flow=y", "https://workspace.example.invalid", 400},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			f := setup(t)
+			status, h, body := f.request(t, "POST", tc.path, tc.body, "", map[string]string{"Content-Type": "application/x-www-form-urlencoded", "Origin": tc.origin})
+			if status != tc.status || !strings.Contains(body, "Connection interrupted") || !strings.Contains(body, "<style>"+consentCSS+"</style>") || !strings.Contains(h.Get("Content-Security-Policy"), "style-src 'sha256-") || h.Get("Cache-Control") != "no-store" {
+				t.Fatalf("status=%d headers=%v body=%s", status, h, body)
+			}
+		})
+	}
+	t.Run("rate limit", func(t *testing.T) {
+		f := setup(t)
+		f.login.limiter = rate.NewLimiter(0, 0)
+		status, h, body := f.request(t, "GET", "/authorize", "", "", nil)
+		if status != 429 || h.Get("Retry-After") != "1" || !strings.Contains(body, "Too many connection requests") {
+			t.Fatal(status, h, body)
+		}
+	})
+	t.Run("persistence unavailable", func(t *testing.T) {
+		f := setup(t)
+		f.login.failed = true
+		status, h, body := f.request(t, "GET", "/authorize", "", "", nil)
+		if status != 503 || h.Get("Cache-Control") != "no-store" || !strings.Contains(h.Get("Content-Security-Policy"), "style-src 'sha256-") || !strings.Contains(body, "Gate sign-in is unavailable") {
+			t.Fatal(status, h, body)
+		}
+	})
 }

@@ -12,7 +12,7 @@ for arch in amd64 arm64; do
   cp LICENSE README.md SETUP.md "$dir/"
   cp scripts/gate-local "$dir/gate-local"
   cp -R docs deploy examples "$dir/"
-  tar --sort=name --mtime='UTC 1970-01-01' --owner=0 --group=0 --numeric-owner -czf "dist/gate-v1.0.0-beta.1-linux-$arch.tar.gz" -C dist "gate-linux-$arch"
+  tar --sort=name --mtime='UTC 1970-01-01' --owner=0 --group=0 --numeric-owner -czf "dist/gate-v0.1.0-beta.1-linux-$arch.tar.gz" -C dist "gate-linux-$arch"
   rm -rf "$dir"
 done
 (cd dist && sha256sum *.tar.gz > SHA256SUMS)

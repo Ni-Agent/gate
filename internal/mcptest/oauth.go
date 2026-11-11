@@ -154,19 +154,27 @@ func (a *LocalAuth) Handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		a.opMu.Lock()
 		defer a.opMu.Unlock()
-		if a.failed {
-			http.Error(w, "OAuth persistence unavailable; operator intervention required", 503)
-			return
-		}
 		w.Header().Set("Cache-Control", "no-store")
 		w.Header().Set("Pragma", "no-cache")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("Referrer-Policy", "no-referrer")
 		// The login handlers add only the validated flow's exact callback.
 		setCallbackPolicy(w, "")
+		if a.failed {
+			if r.URL.Path == "/authorize" {
+				a.loginError(w, 503, "Gate sign-in is unavailable", "Ask the Gate operator to restore the service, then start the connection again.")
+			} else {
+				http.Error(w, "OAuth persistence unavailable; operator intervention required", 503)
+			}
+			return
+		}
 		if !a.limiter.Allow() {
 			w.Header().Set("Retry-After", "1")
-			http.Error(w, "rate limited", 429)
+			if r.URL.Path == "/authorize" {
+				a.loginError(w, 429, "Too many connection requests", "Wait a moment, then start the connection again from your connector.")
+			} else {
+				http.Error(w, "rate limited", 429)
+			}
 			return
 		}
 		r.Body = http.MaxBytesReader(w, r.Body, 16<<10)
@@ -176,7 +184,11 @@ func (a *LocalAuth) Handler() http.Handler {
 		if r.Method == "POST" {
 			if err := a.tokens.save(); err != nil {
 				a.failed = true
-				http.Error(w, "OAuth persistence failed; reconnect after operator recovery", 503)
+				if r.URL.Path == "/authorize" {
+					a.loginError(w, 503, "Gate sign-in is unavailable", "Ask the Gate operator to restore the service, then start the connection again.")
+				} else {
+					http.Error(w, "OAuth persistence failed; reconnect after operator recovery", 503)
+				}
 				return
 			}
 		}
@@ -212,21 +224,34 @@ func (a *LocalAuth) validateRequest(r *http.Request) error {
 	return nil
 }
 
-var consent = template.Must(template.New("consent").Parse(`<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Gate login</title><h1>Connect {{.Client}} to Gate</h1><p>This connection can read and update your Gate knowledge base and tasks.</p><p>Requested permissions: {{.Scopes}}</p><form method="post" action="/authorize"><input type="hidden" name="flow" value="{{.Flow}}"><label>Gate login password <input type="password" name="password" required autocomplete="current-password"></label><button type="submit">Sign in and allow</button></form></html>`))
+const consentCSS = `:root{color-scheme:light dark;font-family:system-ui,-apple-system,sans-serif;background:#f2f4f7;color:#172232}*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;padding:28px 18px}.shell{width:min(100%,490px)}.brand{font-weight:750;letter-spacing:.02em;margin:0 0 20px;color:#355469}.mark{display:inline-grid;place-items:center;width:32px;height:32px;margin-right:9px;border-radius:10px;background:#153f47;color:#fff;font-size:15px}.card{background:#fff;border:1px solid #dce4e7;border-radius:20px;padding:clamp(24px,6vw,38px);box-shadow:0 16px 48px #20353a12}.eyebrow{font-size:.75rem;text-transform:uppercase;letter-spacing:.1em;font-weight:750;color:#36766e;margin:0 0 12px}h1{font-size:clamp(1.65rem,5vw,2rem);line-height:1.16;letter-spacing:-.035em;margin:0 0 14px}p{line-height:1.55;color:#4d5e69}.intro{margin:0 0 24px}.notice{background:#edf6f3;border:1px solid #cfe6dc;border-radius:12px;padding:14px 16px;margin:0 0 24px;color:#244c42;font-size:.94rem}.notice strong{display:block;margin-bottom:4px}label{display:block;font-weight:700;margin:0 0 8px}input{width:100%;font:inherit;padding:13px 14px;border:1px solid #aabac0;border-radius:10px;background:#fff;color:#172232}input:focus-visible,button:focus-visible{outline:3px solid #54ab9b;outline-offset:3px}.hint{font-size:.86rem;margin:8px 0 20px}button{width:100%;font:inherit;font-weight:700;color:white;background:#155f56;border:0;border-radius:10px;padding:14px;cursor:pointer}button:hover{background:#104c45}.origin{font-size:.83rem;overflow-wrap:anywhere;margin:22px 0 0;color:#637780}.origin strong{color:inherit}.error{background:#fff2ed;border-color:#f1cbbd;color:#773f2f}.footer{font-size:.83rem;text-align:center;margin:18px 8px;color:#6a7b84}@media(prefers-color-scheme:dark){:root{background:#101a1d;color:#e8f1ef}.brand{color:#bad3ce}.card{background:#19292c;border-color:#32494b;box-shadow:none}p,.origin,.footer{color:#aec1be}.eyebrow{color:#81cab8}.notice{background:#1d3833;border-color:#365f52;color:#cce9da}.error{background:#422a25;border-color:#73473d;color:#f5d2c7}input{background:#102023;color:#edf6f4;border-color:#607b77}button{background:#68c4ae;color:#102520}button:hover{background:#8bd8c5}}`
+
+var consent = template.Must(template.New("consent").Parse(`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{{if .Error}}Connection interrupted{{else}}Connect {{.Client}}{{end}} · Gate</title><style>{{.Style}}</style></head><body><main class="shell"><div class="brand"><span class="mark" aria-hidden="true">G</span>Gate</div><section class="card" aria-labelledby="title">{{if .Error}}<p class="eyebrow">Connection interrupted</p><h1 id="title">{{.ErrorTitle}}</h1><div class="notice error" role="alert">{{.Error}}</div><p>Return to your connector and start the connection again. If you need the Gate login password, ask the Gate operator.</p>{{else}}<p class="eyebrow">Connect your workspace</p><h1 id="title">Connect {{.Client}} to Gate</h1><p class="intro">Allow {{.Client}} to use the knowledge and tasks in your Gate workspace.</p><div class="notice"><strong>Review access</strong>This connection can {{if .CanWrite}}read and update{{else}}read{{end}} shared knowledge and tasks. This access applies to all knowledge and tasks in this workspace.</div>{{if .FormError}}<div class="notice error" role="alert">{{.FormError}}</div>{{end}}<form method="post" action="/authorize"><input type="hidden" name="flow" value="{{.Flow}}"><label for="password">Gate login password</label><input id="password" type="password" name="password" required autocomplete="current-password" aria-describedby="password-hint"><p class="hint" id="password-hint">Use the password provided by your Gate operator. This is separate from your {{.Client}} password.</p><button type="submit">Sign in and allow access</button></form><p class="hint">To cancel, close this window and return to {{.Client}}.</p>{{end}}<p class="origin">Connecting to <strong>{{.Origin}}</strong></p></section><p class="footer">Gate · Shared knowledge and tasks</p></main></body></html>`))
+
+func (a *LocalAuth) loginPage(w http.ResponseWriter, status int, values map[string]any) {
+	values["Origin"] = a.config.PublicURL
+	values["Style"] = template.CSS(consentCSS)
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(status)
+	_ = consent.Execute(w, values)
+}
+func (a *LocalAuth) loginError(w http.ResponseWriter, status int, title, message string) {
+	a.loginPage(w, status, map[string]any{"ErrorTitle": title, "Error": message})
+}
 
 func (a *LocalAuth) startLogin(w http.ResponseWriter, r *http.Request) {
 	if err := a.validateRequest(r); err != nil {
-		http.Error(w, "invalid authorization request", 400)
+		a.loginError(w, 400, "This connection request is invalid", "Return to your connector and start a new connection.")
 		return
 	}
 	setCallbackPolicy(w, r.URL.Query().Get("redirect_uri"))
 	ar, err := a.provider.NewAuthorizeRequest(r.Context(), r)
 	if err != nil {
-		http.Error(w, "invalid authorization request", 400)
+		a.loginError(w, 400, "This connection request is invalid", "Return to your connector and start a new connection.")
 		return
 	}
 	if !ar.GetRequestedScopes().Has(ReadScope) {
-		http.Error(w, "notes:read scope required", 400)
+		a.loginError(w, 400, "Access could not be requested", "The connector did not request the required access.")
 		return
 	}
 	a.mu.Lock()
@@ -238,7 +263,7 @@ func (a *LocalAuth) startLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(a.pending) >= 128 {
 		a.mu.Unlock()
-		http.Error(w, "too many pending logins", 429)
+		a.loginError(w, 429, "Too many connection requests", "Wait a moment before trying again.")
 		return
 	}
 	flow := randomSecret()
@@ -250,61 +275,64 @@ func (a *LocalAuth) startLogin(w http.ResponseWriter, r *http.Request) {
 	// same-origin proof for our CSRF check without leaking OAuth query values
 	// to the external callback. Other auth responses retain no-referrer.
 	w.Header().Set("Referrer-Policy", "same-origin")
-	_ = consent.Execute(w, map[string]string{"Client": a.clients[ar.GetClient().GetID()].name, "Flow": flow, "Scopes": strings.Join(ar.GetRequestedScopes(), ", ")})
+	a.loginPage(w, http.StatusOK, map[string]any{"Client": a.clients[ar.GetClient().GetID()].name, "Flow": flow, "CanWrite": ar.GetRequestedScopes().Has(WriteScope)})
 }
 
 func (a *LocalAuth) finishLogin(w http.ResponseWriter, r *http.Request) {
 	if r.Header.Get("Origin") != a.config.PublicURL {
-		http.Error(w, "origin rejected", 403)
+		a.loginError(w, 403, "Your connection could not continue", "The sign-in request could not be verified. Start the connection again from your connector.")
 		return
 	}
 	if r.URL.RawQuery != "" || r.ParseForm() != nil {
-		http.Error(w, "invalid form", 400)
+		a.loginError(w, 400, "Your connection could not continue", "The sign-in request was invalid. Start the connection again from your connector.")
 		return
 	}
 	for _, values := range r.PostForm {
 		if len(values) != 1 {
-			http.Error(w, "duplicate parameters", 400)
+			a.loginError(w, 400, "Your connection could not continue", "The sign-in request was invalid. Start the connection again from your connector.")
 			return
 		}
 	}
 	cookie, err := r.Cookie("__Host-workflow-login")
 	flow := r.PostForm.Get("flow")
 	if err != nil || flow == "" || cookie.Value != flow {
-		http.Error(w, "invalid login session", 403)
+		a.loginError(w, 403, "Your connection could not continue", "The login session is missing or no longer valid.")
 		return
 	}
 	a.mu.Lock()
 	pending, ok := a.pending[flow]
-	delete(a.pending, flow)
 	a.mu.Unlock()
 	if !ok || time.Now().After(pending.expires) {
-		http.Error(w, "login expired; reconnect from your connector", 400)
-		return
-	}
-	got, want := sha256.Sum256([]byte(r.PostForm.Get("password"))), sha256.Sum256([]byte(a.credentials.LoginPassword))
-	if subtle.ConstantTimeCompare(got[:], want[:]) != 1 {
-		http.Error(w, "login failed; reconnect from your connector", 401)
+		a.loginError(w, 400, "Your connection expired", "For your security, connection requests expire after a few minutes.")
 		return
 	}
 	original, _ := http.NewRequestWithContext(r.Context(), "GET", a.config.PublicURL+"/authorize?"+pending.query, nil)
 	if err := a.validateRequest(original); err != nil {
-		http.Error(w, "invalid authorization request", 400)
+		a.loginError(w, 400, "This connection request is invalid", "Return to your connector and start a new connection.")
 		return
 	}
 	setCallbackPolicy(w, original.URL.Query().Get("redirect_uri"))
 	ar, err := a.provider.NewAuthorizeRequest(r.Context(), original)
 	if err != nil {
-		http.Error(w, "invalid authorization request", 400)
+		a.loginError(w, 400, "This connection request is invalid", "Return to your connector and start a new connection.")
 		return
 	}
+	got, want := sha256.Sum256([]byte(r.PostForm.Get("password"))), sha256.Sum256([]byte(a.credentials.LoginPassword))
+	if subtle.ConstantTimeCompare(got[:], want[:]) != 1 {
+		w.Header().Set("Referrer-Policy", "same-origin")
+		a.loginPage(w, 401, map[string]any{"Client": a.clients[ar.GetClient().GetID()].name, "Flow": flow, "CanWrite": ar.GetRequestedScopes().Has(WriteScope), "FormError": "That password did not match. Check your Gate login password and try again."})
+		return
+	}
+	a.mu.Lock()
+	delete(a.pending, flow)
+	a.mu.Unlock()
 	for _, scope := range ar.GetRequestedScopes() {
 		ar.GrantScope(scope)
 	}
 	ar.GrantAudience(a.config.PublicURL + "/mcp")
 	response, err := a.provider.NewAuthorizeResponse(r.Context(), ar, &fosite.DefaultSession{Subject: a.clients[ar.GetClient().GetID()].identity})
 	if err != nil {
-		http.Error(w, "authorization failed", 400)
+		a.loginError(w, 400, "Your connection could not be completed", "Start the connection again from your connector. If this continues, contact the Gate operator.")
 		return
 	}
 	http.SetCookie(w, &http.Cookie{Name: "__Host-workflow-login", Value: "", Path: "/", Secure: true, HttpOnly: true, SameSite: http.SameSiteLaxMode, MaxAge: -1})
@@ -378,5 +406,6 @@ func setCallbackPolicy(w http.ResponseWriter, callback string) {
 	if callback != "" {
 		action += " " + callback
 	}
-	w.Header().Set("Content-Security-Policy", "default-src 'none'; form-action "+action+"; frame-ancestors 'none'; base-uri 'none'")
+	digest := sha256.Sum256([]byte(consentCSS))
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'sha256-"+base64.StdEncoding.EncodeToString(digest[:])+"'; form-action "+action+"; frame-ancestors 'none'; base-uri 'none'")
 }

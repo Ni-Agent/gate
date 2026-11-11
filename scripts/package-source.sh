@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 cd "$(dirname "$0")/.."
-version=v1.0.0-beta.1
+version=v0.1.0-beta.1
 [ "$(git rev-parse HEAD)" = "$(git rev-parse "$version^{commit}")" ] || { echo 'HEAD must match the release tag' >&2; exit 1; }
 [ -z "$(git status --porcelain --untracked-files=normal)" ] || { echo 'Working tree must be clean' >&2; exit 1; }
 mkdir -p dist
