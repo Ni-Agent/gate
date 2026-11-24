@@ -3,6 +3,32 @@ import json
 from client.gate_client import GateError
 
 
+def register_session_tools(ctx):
+    from gateway.session_context import get_session_env
+
+    def address(args, **kwargs):
+        key, sid = (get_session_env(f'HERMES_SESSION_{field}') for field in ('KEY', 'ID'))
+        if not key or not sid:
+            return json.dumps({'error': 'No Hermes session address in this tool context.'})
+        return json.dumps({'session_key': key, 'session_id': sid})
+
+    def send(args, **kwargs):
+        key, text = args.get('session_key'), args.get('text')
+        if not isinstance(key, str) or not key.strip() or not isinstance(text, str) or not text.strip():
+            return json.dumps({'error': 'Provide a non-empty session key and message.'})
+        return json.dumps({'scheduled': ctx.inject_message(text, role='peer', session_key=key)})
+
+    for name, handler, description, fields in (
+        ('current_session_address', address, 'Get your Hermes routing key for sending and transcript ID for reading.', ()),
+        ('send_to_session', send, 'Schedule text for an existing Hermes session in this profile by routing key (not transcript ID). Does not confirm delivery or return a reply.',
+         ('session_key', 'text')),
+    ):
+        ctx.register_tool(name=name, toolset='gate_native', handler=handler, check_fn=lambda: True,
+            schema={'name': name, 'description': description, 'parameters': {'type': 'object',
+                'properties': {field: {'type': 'string'} for field in fields},
+                'required': list(fields), 'additionalProperties': False}})
+
+
 def _scrub(value, token):
     if isinstance(value, str):
         return value.replace(token, '<redacted>')
