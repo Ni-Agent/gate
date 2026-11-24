@@ -1,0 +1,12 @@
+name: gate-alpha-native
+label: Gate alpha native service (isolated minimal candidate)
+version: 0.0.2-alpha.2-test
+kind: standalone
+manifest_version: 2
+api_version: 1
+description: Compact authenticated Gate notifications and a generic profile-scoped API tool.
+provides_tools:
+  - gate_call
+requires_env:
+  - GATE_URL
+  - GATE_TOKEN
